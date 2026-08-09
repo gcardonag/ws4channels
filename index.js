@@ -4,6 +4,7 @@ const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
 const fs = require('fs');
 const { PassThrough } = require('stream');
+const { execFile } = require('child_process');
 const os = require('os');
 
 // Increase the process listener limit. Puppeteer registers process-level
@@ -16,7 +17,7 @@ process.setMaxListeners(50);
 
 const app = express();
 
-const VERSION = '2.1'; // version 2.1 - backpressure + restart logging
+const VERSION = '2.2'; // version 2.2 - audio stall watchdog
 const ZIP_CODE = process.env.ZIP_CODE || '90210';
 const WS4KP_HOST = process.env.WS4KP_HOST || 'localhost';
 const WS4KP_PORT = process.env.WS4KP_PORT || '8080';
@@ -82,6 +83,25 @@ let framesWritten = 0;
 let framesSkippedBackpressure = 0;
 let framesSkippedOverlap = 0;
 
+// --- Audio stall watchdog ---
+// The video (screenshot pipe) and audio (music concat, paced with -re) inputs
+// are two independently-clocked realtime feeds with no resync between them.
+// If the video side ever falls behind wall clock (a browser restart,
+// sustained backpressure, etc.) the two can diverge enough that ffmpeg's
+// filtergraph/muxer wedges the audio branch permanently: the process keeps
+// running and framesWritten keeps climbing normally, but every HLS segment
+// from that point on has an audio PID with zero packets in it. Because
+// ffmpeg never exits or errors in this failure mode, fluent-ffmpeg's
+// 'error' handler never fires, so nothing else in this file would ever
+// notice or recover. The watchdog below is what actually detects and fixes
+// that: it probes real segments on disk for audio content and forces a full
+// restart if audio has gone missing.
+const WATCHDOG_INTERVAL_MS = 30000;      // how often to probe the latest segment
+const WATCHDOG_STALL_THRESHOLD = 2;      // consecutive audio-less probes before restarting
+let watchdogRestartCount = 0;
+let consecutiveAudioStalls = 0;
+let isRestarting = false;                // guards against overlapping restarts
+
 const waitFor = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function logTS(msg) {
@@ -141,6 +161,67 @@ function createAudioInputFile() {
 
   // Note: Update README to inform users they can add MP3 files to the 'music' folder
   // and that the default files (listed above) are used if no MP3s are found.
+}
+
+// Returns the second-most-recently-modified .ts segment in OUTPUT_DIR, if
+// any. The newest segment may still be actively written by ffmpeg, so we
+// probe the previous one to avoid false positives from a partial file.
+function getLatestFinalizedSegment() {
+  let files;
+  try {
+    files = fs.readdirSync(OUTPUT_DIR)
+      .filter(f => f.endsWith('.ts'))
+      .map(f => {
+        const full = path.join(OUTPUT_DIR, f);
+        return { full, mtimeMs: fs.statSync(full).mtimeMs };
+      })
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+  } catch {
+    return null;
+  }
+  return files.length >= 2 ? files[1].full : null;
+}
+
+// Counts AAC packets in a segment's audio stream via ffprobe. A healthy
+// 2-second segment carries dozens of audio packets; a stalled one carries
+// exactly zero.
+function probeAudioPacketCount(segmentPath) {
+  return new Promise(resolve => {
+    const args = ['-v', 'error', '-select_streams', 'a', '-show_entries', 'packet=pts', '-of', 'csv=p=0', segmentPath];
+    execFile('ffprobe', args, { timeout: 5000 }, (err, stdout) => {
+      if (err) { resolve(null); return; } // couldn't probe; don't treat as a stall
+      resolve(stdout.split('\n').filter(Boolean).length);
+    });
+  });
+}
+
+async function watchdogCheck() {
+  if (isRestarting || !isStreamReady || !ffmpegProc) return;
+
+  const segment = getLatestFinalizedSegment();
+  if (!segment) return; // not enough segments on disk yet
+
+  const audioPackets = await probeAudioPacketCount(segment);
+  if (audioPackets === null) return; // probe failed (e.g. segment rotated out); skip this cycle
+
+  if (audioPackets === 0) {
+    consecutiveAudioStalls++;
+    logTS(`Watchdog: ${path.basename(segment)} has 0 audio packets (stall ${consecutiveAudioStalls}/${WATCHDOG_STALL_THRESHOLD})`);
+    if (consecutiveAudioStalls >= WATCHDOG_STALL_THRESHOLD) {
+      watchdogRestartCount++;
+      logTS(`Watchdog: audio stalled for ${consecutiveAudioStalls} consecutive checks, forcing full restart (watchdog restart #${watchdogRestartCount})`);
+      consecutiveAudioStalls = 0;
+      isRestarting = true;
+      try {
+        await stopTranscoding();
+        await startTranscoding();
+      } finally {
+        isRestarting = false;
+      }
+    }
+  } else {
+    consecutiveAudioStalls = 0;
+  }
 }
 
 function generateXMLTV(host) {
@@ -354,6 +435,7 @@ app.get('/health',(req,res)=>{
   res.status(isStreamReady?200:503).json({
     ready:isStreamReady,
     browserRestarts: browserRestartCount,
+    watchdogRestarts: watchdogRestartCount,
     framesWritten,
     framesSkippedBackpressure,
     framesSkippedOverlap
@@ -366,6 +448,7 @@ console.log(`Version ${VERSION} | Running with ${cpus} CPU cores, ${memoryMB}MB 
 app.listen(STREAM_PORT, async ()=>{
   console.log(`Streaming server running on port ${STREAM_PORT}`);
   await startTranscoding();
+  setInterval(watchdogCheck, WATCHDOG_INTERVAL_MS);
 });
 
 process.on('SIGINT', async ()=>{ console.log('SIGINT received'); await stopTranscoding(); process.exit(); });
